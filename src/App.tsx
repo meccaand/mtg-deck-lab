@@ -1,10 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { analyze, buildPrompt, COLORS, type Issue, type Report } from "./analyze";
 import { FORMATS, formatById } from "./formats";
 import { mergeDuplicates, parseDeck, toArenaText, type Entry } from "./parse";
+import { aiStatus, requestSuggestions, type Suggestion } from "./ai";
+import { checkSwaps, type Checked } from "./verify";
 import { arenaAvailability, fullText, key, lookupCards, manaCost, searchCards, type Card } from "./scryfall";
 
-type Tab = "overview" | "cards" | "find" | "export";
+type Tab = "overview" | "cards" | "suggest" | "find" | "export";
 const COLOR_NAMES: Record<string, string> = { W: "White", U: "Blue", B: "Black", R: "Red", G: "Green" };
 const SAMPLE = `Commander
 1 Narset, Enlightened Master
@@ -129,13 +131,15 @@ export default function App() {
                 </div>
               )}
               <nav>
-                {(["overview", "cards", "find", "export"] as Tab[]).map((t) => (
+                {(["overview", "cards", "suggest", "find", "export"] as Tab[]).map((t) => (
                   <button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>
-                    {{ overview: "Overview", cards: "Cards", find: "Find cards", export: "Export" }[t]}
+                    {{ overview: "Overview", cards: "Cards", suggest: "AI suggestions", find: "Find cards", export: "Export" }[t]}
                   </button>
                 ))}
               </nav>
-              {!loaded ? <p className="muted">{busy || "…"}</p> : tab === "overview" ? <Overview report={report} /> : tab === "cards" ? <Cards report={report} onQty={changeQty} onArena={onArena} /> : tab === "find" ? (
+              {!loaded ? <p className="muted">{busy || "…"}</p> : tab === "overview" ? <Overview report={report} /> : tab === "cards" ? <Cards report={report} onQty={changeQty} onArena={onArena} /> : tab === "suggest" ? (
+                <Suggest report={report} entries={entries} cards={cards} fmtId={formatId} onQty={changeQty} onAdd={addCard} />
+              ) : tab === "find" ? (
                 <Find fmtId={formatId} commander={commanderCard} entries={entries} onAdd={addCard} />
               ) : (
                 <Export report={report} entries={entries} fmtId={formatId} />
@@ -312,5 +316,94 @@ function Copyable({ title, hint, text }: { title: string; hint: string; text: st
       <textarea readOnly value={text} rows={10} />
       <button onClick={async () => { await navigator.clipboard.writeText(text); setDone(true); setTimeout(() => setDone(false), 1500); }}>{done ? "Copied" : "Copy"}</button>
     </section>
+  );
+}
+
+function Suggest({ report, entries, cards, fmtId, onQty, onAdd }: { report: Report; entries: Entry[]; cards: Map<string, Card>; fmtId: string; onQty: (e: Entry, d: number) => void; onAdd: (c: Card) => void }) {
+  const fmt = formatById(fmtId);
+  const [status, setStatus] = useState<{ enabled: boolean; model: string } | null | undefined>(undefined);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [out, setOut] = useState<{ s: Suggestion; checked: Checked[]; model: string } | null>(null);
+  const [applied, setApplied] = useState<Set<number>>(new Set());
+  useEffect(() => { aiStatus().then(setStatus); }, []);
+
+  async function go() {
+    setError("");
+    setOut(null);
+    setApplied(new Set());
+    try {
+      setBusy("Claude is reading your deck. This can take a minute or two…");
+      const r = await requestSuggestions(buildPrompt(report, fmt));
+      if (r.refused) throw new Error(`The model declined this request${r.category ? ` (${r.category})` : ""}.`);
+      setBusy("Verifying every suggestion against Scryfall…");
+      const checked = await checkSwaps(r.result.swaps, entries, cards, fmt);
+      setOut({ s: r.result, checked, model: r.model });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function apply(i: number) {
+    const c = out?.checked[i];
+    if (!c?.cutEntry || !c.addCard || c.problems.length || applied.has(i)) return;
+    onQty(c.cutEntry, -1);
+    onAdd(c.addCard);
+    setApplied((a) => new Set(a).add(i));
+  }
+  const ok = out?.checked.map((c, i) => (c.problems.length === 0 && !applied.has(i) ? i : -1)).filter((i) => i >= 0) ?? [];
+
+  if (status === undefined) return <p className="muted">Checking AI setup…</p>;
+  if (!status?.enabled) {
+    return (
+      <div>
+        <p><strong>AI suggestions aren't set up yet.</strong></p>
+        <p className="muted">Create a file named <code>.env</code> in the project folder containing <code>ANTHROPIC_API_KEY=your-key</code>, then restart <code>npm run dev</code>. The key stays on your machine: it is read by the local dev server and never sent to the browser. See <code>.env.example</code>.</p>
+        {status === null && <p className="err">The AI endpoint isn't reachable. AI suggestions only work with <code>npm run dev</code> or <code>npm run preview</code>, not a static host.</p>}
+      </div>
+    );
+  }
+  return (
+    <>
+      <p className="muted small">Sends your deck, with Scryfall's real Oracle text for every card, to Claude ({status.model}). Every suggested card is then re-checked against Scryfall for legality, Arena availability, color identity and duplicates before you can apply it.</p>
+      <div className="row">
+        <button className="primary" onClick={go} disabled={!!busy || report.total === 0}>{busy ? "Working…" : out ? "Ask again" : "Get AI suggestions"}</button>
+        {out && ok.length > 0 && <button onClick={() => ok.forEach(apply)}>Apply all {ok.length} verified</button>}
+      </div>
+      {busy && <p className="muted">{busy}</p>}
+      {error && <p className="err">{error}</p>}
+      {out && (
+        <>
+          <h3>Assessment</h3>
+          <p className="oracle">{out.s.assessment}</p>
+          <h3>What the deck needs to do</h3>
+          <p className="oracle">{out.s.game_plan}</p>
+          <h3>Suggested swaps</h3>
+          <table className="cards">
+            <tbody>
+              {out.checked.map((c, i) => (
+                <tr key={i}>
+                  <td className="qty">
+                    <button onClick={() => apply(i)} disabled={c.problems.length > 0 || applied.has(i)}>{applied.has(i) ? "Applied" : "Apply"}</button>
+                  </td>
+                  <td>
+                    <div>
+                      <span className="muted">Cut</span> <strong>{c.swap.cut}</strong> <span className="muted">→ Add</span> <strong>{c.addCard ? <a href={c.addCard.scryfall_uri} target="_blank" rel="noreferrer">{c.addCard.name}</a> : c.swap.add}</strong>
+                      {c.problems.length === 0 ? <em className="badge okb">verified</em> : <em className="badge errb">can't apply</em>}
+                    </div>
+                    <div className="oracle">{c.swap.reason}</div>
+                    {c.problems.map((p) => <div key={p} className="err small">{p}</div>)}
+                    {c.addCard && <div className="muted small">{c.addCard.type_line} {manaCost(c.addCard)} — {fullText(c.addCard).replace(/\n/g, " / ")}</div>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="muted small">Generated by {out.model}. Verified means Scryfall confirms the card exists and passes the format, Arena, color and duplicate checks. It does not mean the swap is a good idea; read the reason.</p>
+        </>
+      )}
+    </>
   );
 }

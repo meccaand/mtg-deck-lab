@@ -52,3 +52,4 @@ td.qty button { padding: 0 7px; margin: 0 4px; }
 a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
 code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 section button { margin-top: 8px; }
+.badge.okb { color: var(--ok); }
